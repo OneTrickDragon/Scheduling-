@@ -39,6 +39,23 @@ CREW_REQUIREMENTS: Dict[FlightType, Dict[Role, int]] = {
 }
 
 
+@dataclass(frozen=True)
+class FlightSpec:
+    """Defaults shared by every flight of one type."""
+    range_km: float          # max distance on one tank (longest allowed leg)
+    capacity: float          # how much the flight carries
+    capacity_unit: str       # "passengers", "tonnes", ...
+
+
+FLIGHT_SPECS: Dict[FlightType, FlightSpec] = {
+    FlightType.DOMESTIC: FlightSpec(3000, 180, "passengers"),
+    FlightType.INTERNATIONAL: FlightSpec(12000, 300, "passengers"),
+    FlightType.CARGO: FlightSpec(7000, 100, "tonnes"),
+    FlightType.CHARTER: FlightSpec(5000, 50, "passengers"),
+    FlightType.TRAINING: FlightSpec(1500, 4, "seats"),
+}
+
+
 # =====================================================================
 # Routes (ready for refuel stops and future path optimization)
 # =====================================================================
@@ -77,6 +94,10 @@ class Route:
     def refuel_stops(self) -> List[str]:
         return [l.destination for l in self.legs if l.refuel_stop]
 
+    def legs_over_range(self, range_km: float) -> List[Leg]:
+        """Legs longer than the range. Legs with unknown distance (0) never match."""
+        return [l for l in self.legs if l.distance_km > range_km]
+
 
 class RoutePlanner(Protocol):
     """Anything with a plan() method can be plugged into the Scheduler."""
@@ -94,18 +115,20 @@ class RefuelRoutePlanner:
 
     Intended design:
       * Nodes are airports (with coordinates and a `can_refuel` flag).
-      * An edge exists between two airports if the distance <= aircraft range.
+      * An edge exists between two airports if the distance <= range_km. The
+        Scheduler passes range_km in from the flight type (FLIGHT_SPECS), or
+        from the flight's own override.
       * Search with Dijkstra / A* (haversine distance as heuristic), with the
         cost being distance, fuel, time, or a weighted mix.
       * Any intermediate airport on the path becomes a Leg with refuel_stop=True.
       * Ground time at each stop extends the flight's end time, so the crew rest
         and duty-hour rules below pick it up automatically.
     """
-    def __init__(self, airports=None, aircraft_range_km: Optional[float] = None):
+    def __init__(self, airports=None):
         self.airports = airports or {}
-        self.aircraft_range_km = aircraft_range_km
 
-    def plan(self, origin: str, destination: str, **constraints) -> Route:
+    def plan(self, origin: str, destination: str, range_km: Optional[float] = None,
+             **constraints) -> Route:
         raise NotImplementedError("Refuel route optimization is not implemented yet")
 
 
@@ -194,10 +217,28 @@ class Flight:
     end: datetime
     crew: List[Staff] = field(default_factory=list)
     route: Optional[Route] = None
+    range_km_override: Optional[float] = None    # None = use the type's default
+    capacity_override: Optional[float] = None    # None = use the type's default
 
     def __post_init__(self):
         if self.route is None:
             self.route = Route([Leg(self.origin, self.destination)])
+
+    @property
+    def spec(self) -> FlightSpec:
+        return FLIGHT_SPECS[self.flight_type]
+
+    @property
+    def range_km(self) -> float:
+        return self.spec.range_km if self.range_km_override is None else self.range_km_override
+
+    @property
+    def capacity(self) -> float:
+        return self.spec.capacity if self.capacity_override is None else self.capacity_override
+
+    @property
+    def capacity_unit(self) -> str:
+        return self.spec.capacity_unit
 
     @property
     def duration(self) -> timedelta:
@@ -235,14 +276,23 @@ class Scheduler:
 
     def create_flight(self, flight_id, flight_type, origin, destination,
                       start: datetime, end: datetime,
-                      route: Optional[Route] = None) -> Flight:
+                      route: Optional[Route] = None,
+                      range_km: Optional[float] = None,
+                      capacity: Optional[float] = None) -> Flight:
         if end <= start:
             raise ValueError("End must be after start")
         if flight_id in self.flights:
             raise ValueError(f"Flight {flight_id} already exists")
-        route = route or self.route_planner.plan(origin, destination)
-        f = Flight(flight_id, FlightType(flight_type), origin, destination,
-                   start, end, route=route)
+        flight_type = FlightType(flight_type)
+        effective_range = FLIGHT_SPECS[flight_type].range_km if range_km is None else range_km
+        route = route or self.route_planner.plan(origin, destination, range_km=effective_range)
+        too_long = route.legs_over_range(effective_range)
+        if too_long:
+            raise ValueError("Range exceeded: " + "; ".join(
+                f"{l.origin}->{l.destination} {l.distance_km:g} km > {effective_range:g} km"
+                for l in too_long))
+        f = Flight(flight_id, flight_type, origin, destination, start, end, route=route,
+                   range_km_override=range_km, capacity_override=capacity)
         self.flights[flight_id] = f
         return f
 
@@ -294,6 +344,8 @@ class Scheduler:
                 "flight_id": f.flight_id, "flight_type": f.flight_type.value,
                 "origin": f.origin, "destination": f.destination,
                 "start": f.start.isoformat(), "end": f.end.isoformat(),
+                "range_km": f.range_km_override,       # None = type default
+                "capacity": f.capacity_override,       # None = type default
                 "route": [{"origin": l.origin, "destination": l.destination,
                            "distance_km": l.distance_km, "refuel_stop": l.refuel_stop}
                           for l in f.route.legs],
@@ -318,7 +370,9 @@ class Scheduler:
             route = Route([Leg(**l) for l in legs]) if legs else None
             f = Flight(d["flight_id"], FlightType(d["flight_type"]), d["origin"],
                        d["destination"], datetime.fromisoformat(d["start"]),
-                       datetime.fromisoformat(d["end"]), route=route)
+                       datetime.fromisoformat(d["end"]), route=route,
+                       range_km_override=d.get("range_km"),
+                       capacity_override=d.get("capacity"))
             for sid in d["crew"]:
                 s = sch.staff[sid]
                 f.crew.append(s)
@@ -355,8 +409,26 @@ if __name__ == "__main__":
                           route=Route([Leg("MAA", "DXB", 3000, refuel_stop=True),
                                        Leg("DXB", "LHR", 5500)]))
     print("Refuel stops:", d.route.refuel_stops)
+    print(f"Cargo defaults: {d.range_km:g} km range, {d.capacity:g} {d.capacity_unit}")
+
+    # Range check: an 8000 km non-stop leg is too long for a domestic flight
+    try:
+        sch.create_flight("AI900", "domestic", "MAA", "LHR",
+                          datetime(2026, 10, 25, 6), datetime(2026, 10, 25, 16),
+                          route=Route([Leg("MAA", "LHR", 8000)]))
+    except ValueError as err:
+        print("Rejected:", err)
+
+    # Per-flight override: this charter has a longer-range aircraft
+    ch = sch.create_flight("CH300", "charter", "MAA", "SYD",
+                           datetime(2026, 10, 26, 1), datetime(2026, 10, 26, 11),
+                           route=Route([Leg("MAA", "SYD", 8000)]),
+                           range_km=9000, capacity=30)
+    print(f"CH300: {ch.range_km:g} km range, {ch.capacity:g} {ch.capacity_unit}")
 
     sch.save("schedule.json")
     r = Scheduler.load("schedule.json")
     print("Reloaded:", [x.name for x in r.flights["AI103"].crew],
           r.flights["CG201"].route.refuel_stops)
+    print("Reloaded CH300:", r.flights["CH300"].range_km, r.flights["CH300"].capacity,
+          "| AI103 default range:", r.flights["AI103"].range_km)
