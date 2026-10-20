@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -54,6 +55,26 @@ FLIGHT_SPECS: Dict[FlightType, FlightSpec] = {
     FlightType.CHARTER: FlightSpec(5000, 50, "passengers"),
     FlightType.TRAINING: FlightSpec(1500, 4, "seats"),
 }
+
+
+# =====================================================================
+# Airports
+# =====================================================================
+@dataclass
+class Airport:
+    code: str                  # e.g. "MAA"
+    name: str
+    lat: float
+    lon: float
+    can_refuel: bool = True    # refuel stops are only allowed where this is True
+
+    def distance_to(self, other: "Airport") -> float:
+        """Great-circle (haversine) distance in km."""
+        p1, p2 = math.radians(self.lat), math.radians(other.lat)
+        dp = p2 - p1
+        dl = math.radians(other.lon - self.lon)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * 6371.0 * math.asin(math.sqrt(a))
 
 
 # =====================================================================
@@ -114,7 +135,7 @@ class RefuelRoutePlanner:
     """PLACEHOLDER for future work.
 
     Intended design:
-      * Nodes are airports (with coordinates and a `can_refuel` flag).
+      * Nodes are airports (the Scheduler passes its airport table in as `airports`).
       * An edge exists between two airports if the distance <= range_km. The
         Scheduler passes range_km in from the flight type (FLIGHT_SPECS), or
         from the flight's own override.
@@ -124,11 +145,8 @@ class RefuelRoutePlanner:
       * Ground time at each stop extends the flight's end time, so the crew rest
         and duty-hour rules below pick it up automatically.
     """
-    def __init__(self, airports=None):
-        self.airports = airports or {}
-
     def plan(self, origin: str, destination: str, range_km: Optional[float] = None,
-             **constraints) -> Route:
+             airports: Optional[Dict[str, "Airport"]] = None, **constraints) -> Route:
         raise NotImplementedError("Refuel route optimization is not implemented yet")
 
 
@@ -269,6 +287,29 @@ class Scheduler:
         self.route_planner = route_planner or DirectRoutePlanner()
         self.staff: Dict[str, Staff] = {}
         self.flights: Dict[str, Flight] = {}
+        self.airports: Dict[str, Airport] = {}
+
+    def add_airport(self, a: Airport) -> Airport:
+        self.airports[a.code] = a
+        return a
+
+    def distance_km(self, a: str, b: str) -> float:
+        return self.airports[a].distance_to(self.airports[b])
+
+    def _prepare_route(self, route: Route) -> None:
+        """If an airport table exists: check codes, fill unknown leg distances,
+        and make sure refuel stops are at airports that can refuel."""
+        if not self.airports:
+            return
+        codes = {l.origin for l in route.legs} | {l.destination for l in route.legs}
+        unknown = sorted(codes - self.airports.keys())
+        if unknown:
+            raise ValueError(f"Unknown airport(s): {', '.join(unknown)}")
+        for l in route.legs:
+            if l.distance_km == 0:
+                l.distance_km = round(self.distance_km(l.origin, l.destination))
+            if l.refuel_stop and not self.airports[l.destination].can_refuel:
+                raise ValueError(f"{l.destination} cannot refuel aircraft")
 
     def add_staff(self, s: Staff) -> Staff:
         self.staff[s.staff_id] = s
@@ -285,7 +326,11 @@ class Scheduler:
             raise ValueError(f"Flight {flight_id} already exists")
         flight_type = FlightType(flight_type)
         effective_range = FLIGHT_SPECS[flight_type].range_km if range_km is None else range_km
-        route = route or self.route_planner.plan(origin, destination, range_km=effective_range)
+        route = route or self.route_planner.plan(origin, destination, range_km=effective_range,
+                                                 airports=self.airports)
+        if route.origin != origin or route.destination != destination:
+            raise ValueError(f"Route {route.origin}->{route.destination} does not match flight")
+        self._prepare_route(route)
         too_long = route.legs_over_range(effective_range)
         if too_long:
             raise ValueError("Range exceeded: " + "; ".join(
@@ -335,6 +380,8 @@ class Scheduler:
     # ---- persistence ----
     def save(self, path: str) -> None:
         data = {
+            "airports": [{"code": a.code, "name": a.name, "lat": a.lat, "lon": a.lon,
+                          "can_refuel": a.can_refuel} for a in self.airports.values()],
             "staff": [{
                 "staff_id": s.staff_id, "name": s.name, "role": s.role.value,
                 "certified_for": sorted(t.value for t in s.certified_for),
@@ -361,6 +408,8 @@ class Scheduler:
         with open(path) as fh:
             data = json.load(fh)
         sch = cls(rest_policy, route_planner)
+        for d in data.get("airports", []):              # older files have none
+            sch.add_airport(Airport(**d))
         for d in data["staff"]:
             sch.add_staff(Staff(d["staff_id"], d["name"], Role(d["role"]),
                                 {FlightType(t) for t in d["certified_for"]},
@@ -383,6 +432,13 @@ class Scheduler:
 
 if __name__ == "__main__":
     sch = Scheduler()
+    for code, name, lat, lon in [("MAA", "Chennai", 12.9941, 80.1709),
+                                 ("DEL", "Delhi", 28.5562, 77.1000),
+                                 ("DXB", "Dubai", 25.2532, 55.3657),
+                                 ("LHR", "London Heathrow", 51.4700, -0.4543),
+                                 ("SYD", "Sydney", -33.9399, 151.1753)]:
+        sch.add_airport(Airport(code, name, lat, lon))
+    sch.add_airport(Airport("RMT", "Remote Airstrip", 20.0, 70.0, can_refuel=False))
     asha = sch.add_staff(Staff("P1", "Asha", Role.CAPTAIN))
 
     a = sch.create_flight("AI101", "domestic", "MAA", "DEL",
@@ -406,29 +462,38 @@ if __name__ == "__main__":
     # A flight with a refuel stop supplied by hand (planner can do this later)
     d = sch.create_flight("CG201", "cargo", "MAA", "LHR",
                           datetime(2026, 10, 20, 2), datetime(2026, 10, 20, 16),
-                          route=Route([Leg("MAA", "DXB", 3000, refuel_stop=True),
-                                       Leg("DXB", "LHR", 5500)]))
+                          route=Route([Leg("MAA", "DXB", refuel_stop=True),
+                                       Leg("DXB", "LHR")]))   # distances auto-filled
+    print("CG201 legs:", [(l.origin, l.destination, l.distance_km) for l in d.route.legs])
     print("Refuel stops:", d.route.refuel_stops)
     print(f"Cargo defaults: {d.range_km:g} km range, {d.capacity:g} {d.capacity_unit}")
 
     # Range check: an 8000 km non-stop leg is too long for a domestic flight
     try:
         sch.create_flight("AI900", "domestic", "MAA", "LHR",
-                          datetime(2026, 10, 25, 6), datetime(2026, 10, 25, 16),
-                          route=Route([Leg("MAA", "LHR", 8000)]))
+                          datetime(2026, 10, 25, 6), datetime(2026, 10, 25, 16))
     except ValueError as err:
         print("Rejected:", err)
 
     # Per-flight override: this charter has a longer-range aircraft
     ch = sch.create_flight("CH300", "charter", "MAA", "SYD",
                            datetime(2026, 10, 26, 1), datetime(2026, 10, 26, 11),
-                           route=Route([Leg("MAA", "SYD", 8000)]),
-                           range_km=9000, capacity=30)
-    print(f"CH300: {ch.range_km:g} km range, {ch.capacity:g} {ch.capacity_unit}")
+                           range_km=10000, capacity=30)
+    print(f"CH300: {ch.range_km:g} km range, {ch.capacity:g} {ch.capacity_unit}, "
+          f"MAA->SYD {ch.route.legs[0].distance_km:g} km")
+
+    # Refuel stop at an airport that can't refuel -> rejected
+    try:
+        sch.create_flight("CG202", "cargo", "MAA", "DEL",
+                          datetime(2026, 10, 27, 2), datetime(2026, 10, 27, 8),
+                          route=Route([Leg("MAA", "RMT", refuel_stop=True), Leg("RMT", "DEL")]))
+    except ValueError as err:
+        print("Rejected:", err)
 
     sch.save("schedule.json")
     r = Scheduler.load("schedule.json")
     print("Reloaded:", [x.name for x in r.flights["AI103"].crew],
           r.flights["CG201"].route.refuel_stops)
     print("Reloaded CH300:", r.flights["CH300"].range_km, r.flights["CH300"].capacity,
-          "| AI103 default range:", r.flights["AI103"].range_km)
+          "| AI103 default range:", r.flights["AI103"].range_km,
+          "| airports:", sorted(r.airports))
