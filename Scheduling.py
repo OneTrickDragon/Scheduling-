@@ -372,6 +372,12 @@ class Scheduler:
             self.assign(flight, s)
         return {}
 
+    def unassign(self, flight: Flight, staff: Staff) -> None:
+        if staff not in flight.crew:
+            raise ValueError(f"{staff.name} is not on {flight.flight_id}")
+        flight.crew.remove(staff)
+        staff.flights.remove(flight)
+
     def cancel_flight(self, flight_id: str) -> None:
         f = self.flights.pop(flight_id)
         for s in f.crew:
